@@ -4,6 +4,7 @@ import Layout from './components/Layout';
 import LiveStatus from './components/LiveStatus';
 import WeeklyCalendar from './components/WeeklyCalendar';
 import Auth from './components/Auth';
+import GeminiAssistant from './components/GeminiAssistant';
 import { SettingsModal } from './components/Modals';
 import { MOCK_USERS, MOCK_SCHEDULE } from './constants';
 import { User, ScheduleEvent } from './types';
@@ -16,7 +17,7 @@ import {
 } from './utils/persistence';
 
 const SESSION_COOKIE = 'tf_session_v11';
-const SYNC_HEARTBEAT_MS = 20000; // Increased frequency for better responsiveness
+const SYNC_HEARTBEAT_MS = 30000;
 
 const App: React.FC = () => {
   const [userEmail, setUserEmail] = useState<string | null>(null);
@@ -41,11 +42,7 @@ const App: React.FC = () => {
 
   // Physical Connectivity Monitor
   useEffect(() => {
-    const handleOnline = () => {
-      setIsOffline(false);
-      setSyncStatus('syncing');
-      if (userEmail) reconcile(userEmail, true);
-    };
+    const handleOnline = () => setIsOffline(false);
     const handleOffline = () => {
       setIsOffline(true);
       setSyncStatus('error');
@@ -56,23 +53,22 @@ const App: React.FC = () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, [userEmail]);
+  }, []);
 
   /**
    * Reconciliation Logic
    */
   const reconcile = useCallback(async (email: string, force: boolean = false) => {
-    if (!email) return;
+    if (!email || !navigator.onLine) return;
     
-    // Don't show syncing indicator for background heartbeats unless forced
     if (force) setSyncStatus('syncing');
 
     try {
       const { account: cloud, source } = await CloudService.fetchAccount(email);
       
       if (cloud && cloud.data) {
-        // If we got remote data, sync it if it's newer
-        if (force || cloud.data.lastUpdated > lastUpdated) {
+        // If remote is newer, update local
+        if (cloud.data.lastUpdated > lastUpdated) {
           setUsers(cloud.data.users || []);
           setSchedule(cloud.data.schedule || []);
           setPasswordHash(cloud.data.passwordHash);
@@ -86,39 +82,49 @@ const App: React.FC = () => {
           lastSyncHash.current = JSON.stringify({ u: cloud.data.users, s: cloud.data.schedule, p: cloudProfile });
         }
         
-        // Update status based on reachability
         if (source === 'network') {
             setSyncStatus('synced');
             setLastSyncedAt(Date.now());
+        // Fix: Changed 'blocked' to 'restricted' to match CloudService.fetchAccount return types
+        } else if (source === 'restricted') {
+            setSyncStatus('error');
         } else {
-            // We have internet, but the server is specifically failing/blocking us
-            setSyncStatus(navigator.onLine ? 'idle' : 'error');
+            setSyncStatus('idle');
         }
       } else {
-        setSyncStatus(navigator.onLine ? 'idle' : 'error');
+        // Fix: Changed 'blocked' to 'restricted' to match CloudService.fetchAccount return types
+        setSyncStatus(source === 'restricted' ? 'error' : 'idle');
       }
     } catch (e) {
       setSyncStatus('error');
     }
   }, [lastUpdated]);
 
-  // Initial Session Check
+  // Initial Load - Local First
   useEffect(() => {
     const session = getCookie(SESSION_COOKIE);
     if (session) {
+      // 1. Load from local cache immediately
       const cached = LocalStorageService.load(session);
       if (cached) {
-        setUsers(cached.users);
-        setSchedule(cached.schedule);
+        setUsers(cached.users || []);
+        setSchedule(cached.schedule || []);
         if (cached.profile) setProfile(cached.profile);
-        if (cached.ts) {
-          setLastUpdated(cached.ts);
-          lastSyncHash.current = JSON.stringify({ u: cached.users, s: cached.schedule, p: cached.profile });
-        }
+        if (cached.passwordHash) setPasswordHash(cached.passwordHash);
+        if (cached.ts) setLastUpdated(cached.ts);
+        lastSyncHash.current = JSON.stringify({ u: cached.users, s: cached.schedule, p: cached.profile });
+      } else {
+        // First time user on this device but has session
+        setUsers(MOCK_USERS);
+        setSchedule(MOCK_SCHEDULE);
+        setProfile({ name: session.split('@')[0], role: 'Lead', photo: `https://picsum.photos/seed/${session}/200` });
       }
+      
       setUserEmail(session);
+      setIsLoaded(true); // Show app UI immediately
+
+      // 2. Try background sync
       reconcile(session, true).finally(() => {
-        setIsLoaded(true);
         initialLoadDone.current = true;
       });
     } else {
@@ -128,12 +134,9 @@ const App: React.FC = () => {
 
   // Background Heartbeat
   useEffect(() => {
-    if (!userEmail || isOffline) return;
+    if (!userEmail || isOffline || syncStatus === 'synced') return;
     const interval = setInterval(() => {
-      // Periodic check to try and upgrade from "Local Only" to "Synced"
-      if (syncStatus === 'error' || syncStatus === 'idle' || syncStatus === 'synced') {
-          reconcile(userEmail);
-      }
+      reconcile(userEmail);
     }, SYNC_HEARTBEAT_MS);
     return () => clearInterval(interval);
   }, [userEmail, reconcile, syncStatus, isOffline]);
@@ -143,21 +146,26 @@ const App: React.FC = () => {
    */
   const handleAuth = async (email: string, password: string, isSignUp: boolean) => {
     setAuthError(null);
-    setIsLoaded(false);
     setSyncStatus('syncing');
 
     try {
       const { account: cloud, source } = await CloudService.fetchAccount(email);
 
       if (isSignUp) {
-        if (cloud && cloud.data.email === email && source === 'network') {
-          setAuthError('This email is already registered.');
-          setIsLoaded(true);
-          return;
-        }
-        
         const initialProfile = { name: email.split('@')[0], role: 'Team Lead', photo: `https://picsum.photos/seed/${email}/200` };
         const now = Date.now();
+        
+        // Save locally first
+        setCookie(SESSION_COOKIE, email);
+        setUserEmail(email);
+        setPasswordHash(password);
+        setUsers(MOCK_USERS);
+        setSchedule(MOCK_SCHEDULE);
+        setProfile(initialProfile);
+        setLastUpdated(now);
+        initialLoadDone.current = true;
+
+        // Try to push to cloud
         const res = await CloudService.pushAccount(email, { 
           users: MOCK_USERS, 
           schedule: MOCK_SCHEDULE,
@@ -168,32 +176,25 @@ const App: React.FC = () => {
           lastUpdated: now
         });
         
-        if (!res.success && !navigator.onLine) {
-          setAuthError('No internet connection. Cannot create account.');
-          setIsLoaded(true);
+        // Fix: Property 'isBlocked' does not exist on type, using 'isRestricted' instead
+        setSyncStatus(res.success ? 'synced' : res.isRestricted ? 'error' : 'idle');
+      } else {
+        // Login requires cloud unless we have it cached
+        // Fix: Changed 'blocked' to 'restricted' to match CloudService.fetchAccount return types
+        if (!cloud && source === 'restricted') {
+          setAuthError('Connection blocked. Disable Ad-Blockers to log in for the first time.');
+          setSyncStatus('error');
           return;
         }
 
-        setCookie(SESSION_COOKIE, email);
-        setUserEmail(email);
-        setPasswordHash(password);
-        setUsers(MOCK_USERS);
-        setSchedule(MOCK_SCHEDULE);
-        setProfile(initialProfile);
-        setLastUpdated(now);
-        lastSyncHash.current = JSON.stringify({ u: MOCK_USERS, s: MOCK_SCHEDULE, p: initialProfile });
-        setSyncStatus(res.success ? 'synced' : 'error');
-      } else {
-        if (!cloud || source !== 'network') {
-          setAuthError('Account not found on cloud. Ensure you are online.');
-          setIsLoaded(true);
-          setSyncStatus('error');
+        if (!cloud) {
+          setAuthError('Account not found. Check your internet or sign up.');
+          setSyncStatus('idle');
           return;
         }
         
         if (cloud.data.passwordHash !== password) {
           setAuthError('Invalid password.');
-          setIsLoaded(true);
           return;
         }
 
@@ -211,15 +212,13 @@ const App: React.FC = () => {
         setProfile(cloudProfile);
         setLastUpdated(cloud.data.lastUpdated);
         lastSyncHash.current = JSON.stringify({ u: cloud.data.users, s: cloud.data.schedule, p: cloudProfile });
-        setSyncStatus('synced');
+        setSyncStatus(source === 'network' ? 'synced' : 'idle');
+        initialLoadDone.current = true;
       }
     } catch (e) {
-      setAuthError('Cloud authentication failed.');
+      setAuthError('Authentication failed.');
       setSyncStatus('error');
     }
-    
-    setIsLoaded(true);
-    initialLoadDone.current = true;
   };
 
   /**
@@ -227,15 +226,15 @@ const App: React.FC = () => {
    */
   useEffect(() => {
     if (userEmail && initialLoadDone.current) {
-      LocalStorageService.save(userEmail, { users, schedule, profile });
+      LocalStorageService.save(userEmail, { users, schedule, profile, passwordHash });
       
       const currentHash = JSON.stringify({ u: users, s: schedule, p: profile });
       if (currentHash === lastSyncHash.current) return;
 
-      setSyncStatus('syncing');
       if (syncTimeout.current) clearTimeout(syncTimeout.current);
       
       syncTimeout.current = window.setTimeout(async () => {
+        setSyncStatus('syncing');
         const result = await CloudService.pushAccount(userEmail, { 
           users, 
           schedule,
@@ -253,10 +252,10 @@ const App: React.FC = () => {
         } else if (result.error === 'Conflict') {
           setSyncStatus('conflict');
         } else {
-          // Keep trying in the background if it failed due to server issues
-          setSyncStatus(navigator.onLine ? 'idle' : 'error');
+          // Fix: Property 'isBlocked' does not exist on type, using 'isRestricted' instead
+          setSyncStatus(result.isRestricted ? 'error' : 'idle');
         }
-      }, 2000); // Faster debounce for snappier feel
+      }, 3000);
     }
   }, [users, schedule, profile, userEmail, passwordHash]);
 
@@ -271,53 +270,8 @@ const App: React.FC = () => {
     lastSyncHash.current = '';
   };
 
-  // UI Handlers
-  const triggerSync = () => userEmail && reconcile(userEmail, true);
-  const updateProfile = (name: string, role: string, photo: string) => {
-    setProfile({ name, role, photo });
-    setLastUpdated(Date.now());
-  };
-  const updatePassword = (newPass: string) => {
-    setPasswordHash(newPass);
-    setLastUpdated(Date.now());
-  };
-  const addUser = (user: User) => { setUsers([...users, user]); setLastUpdated(Date.now()); };
-  const updateUser = (u: User) => { setUsers(users.map(old => old.id === u.id ? u : old)); setLastUpdated(Date.now()); };
-  const deleteUser = (id: string) => {
-    setUsers(users.filter(u => u.id !== id));
-    setSchedule(schedule.filter(s => s.userId !== id));
-    setLastUpdated(Date.now());
-  };
-  const reorderUser = (id: string, dir: 'up' | 'down') => {
-    const idx = users.findIndex(u => u.id === id);
-    const target = dir === 'up' ? idx - 1 : idx + 1;
-    if (target < 0 || target >= users.length) return;
-    const nextUsers = [...users];
-    [nextUsers[idx], nextUsers[target]] = [nextUsers[target], nextUsers[idx]];
-    setUsers(nextUsers);
-    setLastUpdated(Date.now());
-  };
-  const addEvent = (e: ScheduleEvent) => { setSchedule([...schedule, e]); setLastUpdated(Date.now()); };
-  const addEvents = (es: ScheduleEvent[]) => { setSchedule([...schedule, ...es]); setLastUpdated(Date.now()); };
-  const updateEvent = (e: ScheduleEvent) => { setSchedule(schedule.map(s => s.id === e.id ? e : s)); setLastUpdated(Date.now()); };
-  const deleteEvent = (id: string) => { setSchedule(schedule.filter(s => s.id !== id)); setLastUpdated(Date.now()); };
-
-  if (!isLoaded) {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 p-10 text-center">
-        <div className="relative mb-8">
-           <div className="animate-spin rounded-full h-16 w-16 border-4 border-indigo-600 border-t-transparent shadow-xl"></div>
-           <div className="absolute inset-0 flex items-center justify-center text-indigo-600 font-black text-xl">TF</div>
-        </div>
-        <p className="text-slate-700 font-bold text-lg">Initializing TeamFlow Engine</p>
-        <p className="text-slate-400 text-xs mt-3 uppercase tracking-widest font-bold">Connecting to global cloud...</p>
-      </div>
-    );
-  }
-
-  if (!userEmail) {
-    return <Auth onAuth={handleAuth} error={authError} />;
-  }
+  if (!isLoaded) return null;
+  if (!userEmail) return <Auth onAuth={handleAuth} error={authError} />;
 
   return (
     <Layout 
@@ -330,35 +284,49 @@ const App: React.FC = () => {
       syncStatus={syncStatus}
       isOffline={isOffline}
       lastSyncedAt={lastSyncedAt}
-      onTriggerSync={triggerSync}
+      onTriggerSync={() => reconcile(userEmail, true)}
     >
       {activeTab === 'live' ? (
         <LiveStatus 
           users={users} 
           schedule={schedule} 
-          onAddUser={addUser}
-          onUpdateUser={updateUser}
-          onDeleteUser={deleteUser}
-          onReorderUser={reorderUser}
+          onAddUser={(u) => { setUsers([...users, u]); setLastUpdated(Date.now()); }}
+          onUpdateUser={(u) => { setUsers(users.map(o => o.id === u.id ? u : o)); setLastUpdated(Date.now()); }}
+          onDeleteUser={(id) => { setUsers(users.filter(u => u.id !== id)); setSchedule(schedule.filter(s => s.userId !== id)); setLastUpdated(Date.now()); }}
+          onReorderUser={(id, dir) => {
+            const idx = users.findIndex(u => u.id === id);
+            const target = dir === 'up' ? idx - 1 : idx + 1;
+            if (target < 0 || target >= users.length) return;
+            const n = [...users];
+            [n[idx], n[target]] = [n[target], n[idx]];
+            setUsers(n);
+            setLastUpdated(Date.now());
+          }}
         />
       ) : (
         <WeeklyCalendar 
           users={users} 
           schedule={schedule} 
-          onAddEvent={addEvent}
-          onAddEvents={addEvents}
-          onUpdateEvent={updateEvent}
-          onDeleteEvent={deleteEvent}
+          onAddEvent={(e) => { setSchedule([...schedule, e]); setLastUpdated(Date.now()); }}
+          onAddEvents={(es) => { setSchedule([...schedule, ...es]); setLastUpdated(Date.now()); }}
+          onUpdateEvent={(e) => { setSchedule(schedule.map(s => s.id === e.id ? e : s)); setLastUpdated(Date.now()); }}
+          onDeleteEvent={(id) => { setSchedule(schedule.filter(s => s.id !== id)); setLastUpdated(Date.now()); }}
         />
       )}
+
+      <GeminiAssistant 
+        users={users} 
+        schedule={schedule} 
+        onAddEvents={(es) => { setSchedule([...schedule, ...es]); setLastUpdated(Date.now()); }} 
+      />
 
       <SettingsModal 
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
         profile={profile}
-        onUpdateProfile={updateProfile}
+        onUpdateProfile={(name, role, photo) => { setProfile({ name, role, photo }); setLastUpdated(Date.now()); }}
         currentPassword={passwordHash}
-        onUpdatePassword={updatePassword}
+        onUpdatePassword={(p) => { setPasswordHash(p); setLastUpdated(Date.now()); }}
       />
     </Layout>
   );

@@ -24,8 +24,8 @@ export const eraseCookie = (name: string) => {
 };
 
 /**
- * Cloud Sync Service (Version 12.0 - Local First Update)
- * Uses restful-api.dev as a key-value store simulator for Glide Tables.
+ * Cloud Sync Service
+ * Uses restful-api.dev as a key-value store simulator for TeamFlow data.
  */
 const CLOUD_API_BASE = 'https://api.restful-api.dev/objects';
 
@@ -59,26 +59,34 @@ export const CloudService = {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000);
+      
+      const headers: Record<string, string> = { ...options.headers as any };
+      if (options.body) {
+        headers['Content-Type'] = 'application/json';
+      }
+
       const response = await fetch(url, {
         ...options,
         signal: controller.signal,
-        // Using basic headers to avoid triggering CORS preflight issues on restrictive networks
-        headers: {
-          'Content-Type': 'application/json',
-          ...options.headers,
-        }
+        headers
       });
+      
       clearTimeout(timeoutId);
-      return { ok: response.ok, status: response.status, data: await response.json().catch(() => null) };
+      
+      if (!response.ok && response.status !== 404) {
+        throw new Error(`Cloud Sync Unavailable (${response.status})`);
+      }
+
+      const data = await response.json().catch(() => null);
+      return { ok: response.ok, status: response.status, data };
     } catch (e: any) {
-      // TypeError: Failed to fetch is almost always a CORS block or Ad-Blocker
-      const isBlocked = e.name === 'TypeError' || e.message?.includes('fetch');
-      console.warn("CloudService: Connection issue", e.message);
-      return { ok: false, status: 0, isBlocked, error: e.message };
+      // Treat network errors as sync restriction (firewalls, CORS, or generic blockage)
+      const isRestricted = e.name === 'TypeError' || e.message?.includes('fetch') || e.name === 'AbortError';
+      return { ok: false, status: 0, isRestricted, error: e.message };
     }
   },
 
-  async fetchAccount(email: string): Promise<{ account: CloudAccount | null, source: 'network' | 'cache' | 'blocked' }> {
+  async fetchAccount(email: string): Promise<{ account: CloudAccount | null, source: 'network' | 'cache' | 'restricted' }> {
     const id = getDeterministicId(email);
     const res = await this.safeFetch(`${CLOUD_API_BASE}/${id}`);
     
@@ -92,10 +100,10 @@ export const CloudService = {
       return { account: JSON.parse(localCache), source: 'cache' };
     }
 
-    return { account: null, source: res.isBlocked ? 'blocked' : 'cache' };
+    return { account: null, source: res.isRestricted ? 'restricted' : 'cache' };
   },
 
-  async pushAccount(email: string, payload: any): Promise<{ success: boolean; remoteData?: CloudAccount; error?: string; isBlocked?: boolean }> {
+  async pushAccount(email: string, payload: any): Promise<{ success: boolean; remoteData?: CloudAccount; error?: string; isRestricted?: boolean }> {
     if (!navigator.onLine) return { success: false, error: 'Offline' };
     
     const id = getDeterministicId(email);
@@ -104,12 +112,8 @@ export const CloudService = {
       data: { ...payload, email, lastUpdated: Date.now() }
     };
 
-    const { account: remote, source } = await this.fetchAccount(email);
+    const { account: remote } = await this.fetchAccount(email);
     
-    if (source === 'blocked') {
-        return { success: false, isBlocked: true, error: 'Cloud blocked by browser extension' };
-    }
-
     if (remote && remote.data.lastUpdated > payload.lastUpdated) {
       return { success: false, remoteData: remote, error: 'Conflict' };
     }
@@ -128,7 +132,7 @@ export const CloudService = {
       return { success: true };
     }
 
-    return { success: false, error: res.error || 'Server Error', isBlocked: res.isBlocked };
+    return { success: false, error: res.error || 'Sync Restricted', isRestricted: res.isRestricted };
   }
 };
 
