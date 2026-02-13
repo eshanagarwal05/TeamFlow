@@ -1,0 +1,5 @@
+{
+  "name": "TeamFlow",
+  "description": "A high-performance team availability tracker featuring live status updates, 'In Between' status detection, and a comprehensive weekly calendar view with user-specific filtering.",
+  "requestFramePermissions": []
+}
