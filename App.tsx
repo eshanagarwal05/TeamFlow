@@ -16,11 +16,13 @@ import {
   LocalStorageService
 } from './utils/persistence';
 
-const SESSION_COOKIE = 'tf_session_v11';
-const SYNC_HEARTBEAT_MS = 30000;
+// Version bump for cookie to ensure clean state for DB migration
+const SESSION_COOKIE = 'tf_session_v15'; 
+const SYNC_HEARTBEAT_MS = 15000; // Poll more frequently with real DB
 
 const App: React.FC = () => {
   const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [syncKey, setSyncKey] = useState<string | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'error' | 'idle' | 'conflict'>('idle');
@@ -32,7 +34,6 @@ const App: React.FC = () => {
   // App Data State
   const [users, setUsers] = useState<User[]>([]);
   const [schedule, setSchedule] = useState<ScheduleEvent[]>([]);
-  const [passwordHash, setPasswordHash] = useState<string>('');
   const [profile, setProfile] = useState({ name: '', role: '', photo: '' });
   const [lastUpdated, setLastUpdated] = useState<number>(0);
   
@@ -43,231 +44,142 @@ const App: React.FC = () => {
   // Physical Connectivity Monitor
   useEffect(() => {
     const handleOnline = () => setIsOffline(false);
-    const handleOffline = () => {
-      setIsOffline(true);
-      setSyncStatus('error');
-    };
+    const handleOffline = () => { setIsOffline(true); setSyncStatus('error'); };
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
+    return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
   }, []);
 
   /**
-   * Reconciliation Logic
+   * Sync Key Management
    */
-  const reconcile = useCallback(async (email: string, force: boolean = false) => {
-    if (!email || !navigator.onLine) return;
-    
+  const handleJoinTeam = async (newKey: string) => {
+    setSyncStatus('syncing');
+    const { data, source } = await CloudService.fetchBySyncKey(newKey);
+    if (data) {
+      setUsers(data.users || []);
+      setSchedule(data.schedule || []);
+      setLastUpdated(data.lastUpdated);
+      setSyncKey(newKey);
+      localStorage.setItem(`tf_sync_key_${userEmail}`, newKey);
+      setSyncStatus(source === 'network' ? 'synced' : 'idle');
+      setLastSyncedAt(Date.now());
+      return true;
+    } else {
+      // New team, initialize empty
+      setUsers([]);
+      setSchedule([]);
+      setSyncKey(newKey);
+      localStorage.setItem(`tf_sync_key_${userEmail}`, newKey);
+      setSyncStatus('idle');
+      return true;
+    }
+  };
+
+  /**
+   * Background Reconciliation
+   */
+  const reconcile = useCallback(async (key: string, force: boolean = false) => {
+    if (!key || !navigator.onLine) return;
     if (force) setSyncStatus('syncing');
 
     try {
-      const { account: cloud, source } = await CloudService.fetchAccount(email);
-      
-      if (cloud && cloud.data) {
-        // If remote is newer, update local
-        if (cloud.data.lastUpdated > lastUpdated) {
-          setUsers(cloud.data.users || []);
-          setSchedule(cloud.data.schedule || []);
-          setPasswordHash(cloud.data.passwordHash);
-          const cloudProfile = {
-            name: cloud.data.profileName || email.split('@')[0],
-            role: cloud.data.profileRole || 'Team Member',
-            photo: cloud.data.profilePhoto || `https://picsum.photos/seed/${email}/200`
-          };
-          setProfile(cloudProfile);
-          setLastUpdated(cloud.data.lastUpdated);
-          lastSyncHash.current = JSON.stringify({ u: cloud.data.users, s: cloud.data.schedule, p: cloudProfile });
-        }
-        
-        if (source === 'network') {
-            setSyncStatus('synced');
-            setLastSyncedAt(Date.now());
-        // Fix: Changed 'blocked' to 'restricted' to match CloudService.fetchAccount return types
-        } else if (source === 'restricted') {
-            setSyncStatus('error');
-        } else {
-            setSyncStatus('idle');
-        }
+      const { data, source } = await CloudService.fetchBySyncKey(key);
+      if (data && data.lastUpdated > lastUpdated) {
+        setUsers(data.users || []);
+        setSchedule(data.schedule || []);
+        setLastUpdated(data.lastUpdated);
+        lastSyncHash.current = JSON.stringify({ u: data.users, s: data.schedule });
+        setSyncStatus(source === 'network' ? 'synced' : 'idle');
+        setLastSyncedAt(Date.now());
       } else {
-        // Fix: Changed 'blocked' to 'restricted' to match CloudService.fetchAccount return types
-        setSyncStatus(source === 'restricted' ? 'error' : 'idle');
+        setSyncStatus(source === 'network' ? 'synced' : source === 'restricted' ? 'error' : 'idle');
       }
     } catch (e) {
       setSyncStatus('error');
     }
   }, [lastUpdated]);
 
-  // Initial Load - Local First
+  // Initial Load
   useEffect(() => {
     const session = getCookie(SESSION_COOKIE);
     if (session) {
-      // 1. Load from local cache immediately
+      const storedKey = localStorage.getItem(`tf_sync_key_${session}`);
+      setSyncKey(storedKey);
+
       const cached = LocalStorageService.load(session);
       if (cached) {
         setUsers(cached.users || []);
         setSchedule(cached.schedule || []);
-        if (cached.profile) setProfile(cached.profile);
-        if (cached.passwordHash) setPasswordHash(cached.passwordHash);
-        if (cached.ts) setLastUpdated(cached.ts);
-        lastSyncHash.current = JSON.stringify({ u: cached.users, s: cached.schedule, p: cached.profile });
+        setProfile(cached.profile || { name: session.split('@')[0], role: 'Lead', photo: `https://picsum.photos/seed/${session}/200` });
+        setLastUpdated(cached.ts || 0);
       } else {
-        // First time user on this device but has session
         setUsers(MOCK_USERS);
         setSchedule(MOCK_SCHEDULE);
         setProfile({ name: session.split('@')[0], role: 'Lead', photo: `https://picsum.photos/seed/${session}/200` });
       }
       
       setUserEmail(session);
-      setIsLoaded(true); // Show app UI immediately
+      setIsLoaded(true);
 
-      // 2. Try background sync
-      reconcile(session, true).finally(() => {
+      if (storedKey) {
+        reconcile(storedKey, true).finally(() => { initialLoadDone.current = true; });
+      } else {
         initialLoadDone.current = true;
-      });
+      }
     } else {
       setIsLoaded(true);
     }
   }, [reconcile]);
 
-  // Background Heartbeat
+  // Sync Heartbeat
   useEffect(() => {
-    if (!userEmail || isOffline || syncStatus === 'synced') return;
-    const interval = setInterval(() => {
-      reconcile(userEmail);
-    }, SYNC_HEARTBEAT_MS);
+    if (!syncKey || isOffline) return;
+    const interval = setInterval(() => reconcile(syncKey), SYNC_HEARTBEAT_MS);
     return () => clearInterval(interval);
-  }, [userEmail, reconcile, syncStatus, isOffline]);
+  }, [syncKey, reconcile, isOffline]);
 
   /**
-   * AUTH HANDLER
-   */
-  const handleAuth = async (email: string, password: string, isSignUp: boolean) => {
-    setAuthError(null);
-    setSyncStatus('syncing');
-
-    try {
-      const { account: cloud, source } = await CloudService.fetchAccount(email);
-
-      if (isSignUp) {
-        const initialProfile = { name: email.split('@')[0], role: 'Team Lead', photo: `https://picsum.photos/seed/${email}/200` };
-        const now = Date.now();
-        
-        // Save locally first
-        setCookie(SESSION_COOKIE, email);
-        setUserEmail(email);
-        setPasswordHash(password);
-        setUsers(MOCK_USERS);
-        setSchedule(MOCK_SCHEDULE);
-        setProfile(initialProfile);
-        setLastUpdated(now);
-        initialLoadDone.current = true;
-
-        // Try to push to cloud
-        const res = await CloudService.pushAccount(email, { 
-          users: MOCK_USERS, 
-          schedule: MOCK_SCHEDULE,
-          profileName: initialProfile.name,
-          profileRole: initialProfile.role,
-          profilePhoto: initialProfile.photo,
-          passwordHash: password,
-          lastUpdated: now
-        });
-        
-        // Fix: Property 'isBlocked' does not exist on type, using 'isRestricted' instead
-        setSyncStatus(res.success ? 'synced' : res.isRestricted ? 'error' : 'idle');
-      } else {
-        // Login requires cloud unless we have it cached
-        // Fix: Changed 'blocked' to 'restricted' to match CloudService.fetchAccount return types
-        if (!cloud && source === 'restricted') {
-          setAuthError('Connection blocked. Disable Ad-Blockers to log in for the first time.');
-          setSyncStatus('error');
-          return;
-        }
-
-        if (!cloud) {
-          setAuthError('Account not found. Check your internet or sign up.');
-          setSyncStatus('idle');
-          return;
-        }
-        
-        if (cloud.data.passwordHash !== password) {
-          setAuthError('Invalid password.');
-          return;
-        }
-
-        const cloudProfile = {
-          name: cloud.data.profileName || email.split('@')[0],
-          role: cloud.data.profileRole || 'Member',
-          photo: cloud.data.profilePhoto || ''
-        };
-
-        setCookie(SESSION_COOKIE, email);
-        setUserEmail(email);
-        setPasswordHash(password);
-        setUsers(cloud.data.users);
-        setSchedule(cloud.data.schedule);
-        setProfile(cloudProfile);
-        setLastUpdated(cloud.data.lastUpdated);
-        lastSyncHash.current = JSON.stringify({ u: cloud.data.users, s: cloud.data.schedule, p: cloudProfile });
-        setSyncStatus(source === 'network' ? 'synced' : 'idle');
-        initialLoadDone.current = true;
-      }
-    } catch (e) {
-      setAuthError('Authentication failed.');
-      setSyncStatus('error');
-    }
-  };
-
-  /**
-   * DEBOUNCED PUSH ENGINE
+   * Debounced Push Engine
    */
   useEffect(() => {
-    if (userEmail && initialLoadDone.current) {
-      LocalStorageService.save(userEmail, { users, schedule, profile, passwordHash });
+    if (userEmail && initialLoadDone.current && syncKey) {
+      LocalStorageService.save(userEmail, { users, schedule, profile });
       
-      const currentHash = JSON.stringify({ u: users, s: schedule, p: profile });
+      const currentHash = JSON.stringify({ u: users, s: schedule });
       if (currentHash === lastSyncHash.current) return;
 
       if (syncTimeout.current) clearTimeout(syncTimeout.current);
-      
       syncTimeout.current = window.setTimeout(async () => {
         setSyncStatus('syncing');
-        const result = await CloudService.pushAccount(userEmail, { 
-          users, 
-          schedule,
-          profileName: profile.name,
-          profileRole: profile.role,
-          profilePhoto: profile.photo,
-          passwordHash,
-          lastUpdated: Date.now() 
-        });
-
+        const result = await CloudService.pushBySyncKey(syncKey, { users, schedule });
         if (result.success) {
           setSyncStatus('synced');
           setLastSyncedAt(Date.now());
           lastSyncHash.current = currentHash;
-        } else if (result.error === 'Conflict') {
-          setSyncStatus('conflict');
         } else {
-          // Fix: Property 'isBlocked' does not exist on type, using 'isRestricted' instead
           setSyncStatus(result.isRestricted ? 'error' : 'idle');
         }
-      }, 3000);
+      }, 2000); // Faster debounce for real DB
     }
-  }, [users, schedule, profile, userEmail, passwordHash]);
+  }, [users, schedule, profile, userEmail, syncKey]);
+
+  const handleAuth = async (email: string, password: string, isSignUp: boolean) => {
+    setAuthError(null);
+    setCookie(SESSION_COOKIE, email);
+    setUserEmail(email);
+    const storedKey = localStorage.getItem(`tf_sync_key_${email}`);
+    if (storedKey) setSyncKey(storedKey);
+    initialLoadDone.current = true;
+  };
 
   const handleLogout = () => {
     eraseCookie(SESSION_COOKIE);
     setUserEmail(null);
+    setSyncKey(null);
     setUsers([]);
     setSchedule([]);
-    setPasswordHash('');
-    setProfile({ name: '', role: '', photo: '' });
     initialLoadDone.current = false;
-    lastSyncHash.current = '';
   };
 
   if (!isLoaded) return null;
@@ -284,7 +196,7 @@ const App: React.FC = () => {
       syncStatus={syncStatus}
       isOffline={isOffline}
       lastSyncedAt={lastSyncedAt}
-      onTriggerSync={() => reconcile(userEmail, true)}
+      onTriggerSync={() => syncKey && reconcile(syncKey, true)}
     >
       {activeTab === 'live' ? (
         <LiveStatus 
@@ -325,8 +237,13 @@ const App: React.FC = () => {
         onClose={() => setIsSettingsOpen(false)}
         profile={profile}
         onUpdateProfile={(name, role, photo) => { setProfile({ name, role, photo }); setLastUpdated(Date.now()); }}
-        currentPassword={passwordHash}
-        onUpdatePassword={(p) => { setPasswordHash(p); setLastUpdated(Date.now()); }}
+        syncKey={syncKey}
+        onGenerateKey={() => {
+          const key = CloudService.generateSyncKey();
+          setSyncKey(key);
+          localStorage.setItem(`tf_sync_key_${userEmail}`, key);
+        }}
+        onJoinTeam={handleJoinTeam}
       />
     </Layout>
   );

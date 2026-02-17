@@ -1,4 +1,16 @@
 
+import { createClient } from '@supabase/supabase-js';
+
+// --- Configuration ---
+// ideally these are in process.env, but for this demo context we define them here.
+// You must replace these with your own Supabase project details.
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://xyzcompany.supabase.co'; 
+const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'public-anon-key';
+
+// Initialize Supabase Client
+// Note: In a real prod app, use a dedicated supabase file, but we keep it here to minimize file sprawl
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
 /**
  * Simple cookie management for sessions
  */
@@ -23,125 +35,102 @@ export const eraseCookie = (name: string) => {
   document.cookie = name + '=; Max-Age=-99999999;path=/';
 };
 
-/**
- * Cloud Sync Service
- * Uses restful-api.dev as a key-value store simulator for TeamFlow data.
- */
-const CLOUD_API_BASE = 'https://api.restful-api.dev/objects';
-
-const getDeterministicId = (email: string) => {
-  let hash = 0;
-  const str = email.toLowerCase().trim();
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) - hash) + str.charCodeAt(i);
-    hash |= 0;
-  }
-  return `tf-v12-${Math.abs(hash)}`;
-};
-
-export interface CloudAccount {
-  id: string;
-  name: string;
-  data: {
-    passwordHash: string;
-    users: any[];
-    schedule: any[];
-    profileName?: string;
-    profileRole?: string;
-    profilePhoto?: string;
-    lastUpdated: number;
-    email: string;
-  };
+export interface SyncData {
+  users: any[];
+  schedule: any[];
+  lastUpdated: number;
+  syncKey: string;
 }
 
 export const CloudService = {
-  async safeFetch(url: string, options: RequestInit = {}) {
+  /**
+   * Generates a random high-entropy Sync Key
+   */
+  generateSyncKey: () => {
+    return 'TF-' + Math.random().toString(36).substr(2, 6).toUpperCase() + '-' + Math.random().toString(36).substr(2, 4).toUpperCase();
+  },
+
+  /**
+   * Fetches data using the Sync Key from Supabase
+   */
+  async fetchBySyncKey(syncKey: string): Promise<{ data: SyncData | null, source: 'network' | 'cache' | 'restricted' }> {
+    if (!syncKey) return { data: null, source: 'cache' };
+    
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
-      
-      const headers: Record<string, string> = { ...options.headers as any };
-      if (options.body) {
-        headers['Content-Type'] = 'application/json';
+      // Fetch from 'teamflow_teams' table
+      const { data, error } = await supabase
+        .from('teamflow_teams')
+        .select('data, updated_at')
+        .eq('id', syncKey)
+        .single();
+
+      if (error && error.code !== 'PGRST116') { // PGRST116 is "Row not found"
+        throw error;
       }
 
-      const response = await fetch(url, {
-        ...options,
-        signal: controller.signal,
-        headers
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok && response.status !== 404) {
-        throw new Error(`Cloud Sync Unavailable (${response.status})`);
+      if (data && data.data) {
+        localStorage.setItem(`tf_v15_cache_${syncKey}`, JSON.stringify(data.data));
+        return { data: data.data, source: 'network' };
       }
 
-      const data = await response.json().catch(() => null);
-      return { ok: response.ok, status: response.status, data };
+      // If not found in DB, check local cache (offline mode support)
+      const localCache = localStorage.getItem(`tf_v15_cache_${syncKey}`);
+      if (localCache) {
+        return { data: JSON.parse(localCache), source: 'cache' };
+      }
+
+      return { data: null, source: 'network' }; // Valid connection, just no data yet
     } catch (e: any) {
-      // Treat network errors as sync restriction (firewalls, CORS, or generic blockage)
-      const isRestricted = e.name === 'TypeError' || e.message?.includes('fetch') || e.name === 'AbortError';
-      return { ok: false, status: 0, isRestricted, error: e.message };
+      console.error("Supabase Fetch Error:", e);
+      // Fallback to cache on error
+      const localCache = localStorage.getItem(`tf_v15_cache_${syncKey}`);
+      if (localCache) {
+        return { data: JSON.parse(localCache), source: 'cache' };
+      }
+      return { data: null, source: 'restricted' };
     }
   },
 
-  async fetchAccount(email: string): Promise<{ account: CloudAccount | null, source: 'network' | 'cache' | 'restricted' }> {
-    const id = getDeterministicId(email);
-    const res = await this.safeFetch(`${CLOUD_API_BASE}/${id}`);
+  /**
+   * Pushes data to Supabase using the Sync Key
+   */
+  async pushBySyncKey(syncKey: string, payload: any): Promise<{ success: boolean; error?: string; isRestricted?: boolean }> {
+    if (!navigator.onLine || !syncKey) return { success: false, error: 'Offline or Missing Key' };
     
-    if (res.ok && res.data && res.data.data) {
-      localStorage.setItem(`tf_v12_cache_${id}`, JSON.stringify(res.data));
-      return { account: res.data, source: 'network' };
-    }
-
-    const localCache = localStorage.getItem(`tf_v12_cache_${id}`);
-    if (localCache) {
-      return { account: JSON.parse(localCache), source: 'cache' };
-    }
-
-    return { account: null, source: res.isRestricted ? 'restricted' : 'cache' };
-  },
-
-  async pushAccount(email: string, payload: any): Promise<{ success: boolean; remoteData?: CloudAccount; error?: string; isRestricted?: boolean }> {
-    if (!navigator.onLine) return { success: false, error: 'Offline' };
-    
-    const id = getDeterministicId(email);
-    const finalPayload = {
-      name: `TeamFlow:${email}`,
-      data: { ...payload, email, lastUpdated: Date.now() }
+    const finalData: SyncData = {
+      ...payload,
+      syncKey,
+      lastUpdated: Date.now()
     };
 
-    const { account: remote } = await this.fetchAccount(email);
-    
-    if (remote && remote.data.lastUpdated > payload.lastUpdated) {
-      return { success: false, remoteData: remote, error: 'Conflict' };
-    }
+    try {
+      // Upsert into 'teamflow_teams' table
+      const { error } = await supabase
+        .from('teamflow_teams')
+        .upsert({ 
+          id: syncKey, 
+          data: finalData,
+          updated_at: Date.now()
+        }, { onConflict: 'id' });
 
-    const method = remote ? 'PUT' : 'POST';
-    const url = remote ? `${CLOUD_API_BASE}/${id}` : CLOUD_API_BASE;
-    const savePayload = remote ? finalPayload : { ...finalPayload, id };
+      if (error) throw error;
 
-    const res = await this.safeFetch(url, {
-      method,
-      body: JSON.stringify(savePayload)
-    });
-
-    if (res.ok) {
-      localStorage.setItem(`tf_v12_cache_${id}`, JSON.stringify(res.data));
+      localStorage.setItem(`tf_v15_cache_${syncKey}`, JSON.stringify(finalData));
       return { success: true };
-    }
 
-    return { success: false, error: res.error || 'Sync Restricted', isRestricted: res.isRestricted };
+    } catch (e: any) {
+      console.error("Supabase Push Error:", e);
+      return { success: false, error: e.message || 'Sync Error', isRestricted: true };
+    }
   }
 };
 
 export const LocalStorageService = {
   save: (email: string, data: any) => {
-    localStorage.setItem(`tf_v12_ui_${email}`, JSON.stringify({ ...data, ts: Date.now() }));
+    localStorage.setItem(`tf_v15_local_${email}`, JSON.stringify({ ...data, ts: Date.now() }));
   },
   load: (email: string) => {
-    const data = localStorage.getItem(`tf_v12_ui_${email}`);
+    const data = localStorage.getItem(`tf_v15_local_${email}`);
     return data ? JSON.parse(data) : null;
   }
 };
